@@ -165,6 +165,9 @@ def parse_cli_args():
     if args.verbose is not None and args.quiet:
         parser.error("Cannot specify both --verbose and --quiet!")
 
+    if args.action is None:
+        args.action = emit_json
+
     default_scheme = "wss" if args.ws else "mqtts"
     args.conn_list = [parse_mqtt_uri(uri, default_scheme=default_scheme) for uri in args.uris]
     if not args.conn_list:
