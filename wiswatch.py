@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-"""wisfind
+"""wiswatch
 
 A CLI client to consume real-time geospatial data from the World Meteorological
 Organization Information System (WIS2).
@@ -8,15 +8,14 @@ Organization Information System (WIS2).
 
 from __future__ import annotations
 
-import functools
-import json
-
 __version__ = "0.1.0"
 __author__ = "Max Drexler"
 __email__ = "mndrexler@wisc.edu"
 
 import argparse
 import asyncio
+import functools
+import json
 import logging
 import sys
 import typing as tp
@@ -37,6 +36,7 @@ if tp.TYPE_CHECKING:
         topic: str
 
 
+# Connection URI information
 TRANSPORT_PER_SCHEME: dict[str, tp.Literal["websockets", "tcp"]] = {
     "mqtts": "tcp",
     "wss": "websockets",
@@ -44,7 +44,7 @@ TRANSPORT_PER_SCHEME: dict[str, tp.Literal["websockets", "tcp"]] = {
 
 PORT_PER_SCHEME = {"mqtts": 8883, "wss": 443}
 
-DEFAULT_PASSWORD = "everyone"
+DEFAULT_PASSWORD = "everyone"  # noqa: S105
 DEFAULT_USERNAME = "everyone"
 DEFAULT_HOSTNAME = "globalbroker.meteo.fr"
 
@@ -62,15 +62,13 @@ def default_mqtt_connection(scheme: MQTTScheme | None = None) -> MQTTConnectionI
 
 async def emit_json(msg, ident=None, end="\n"):
     """Default action. Print json string of message."""
-    print(json.dumps(msg, indent=ident), end=end)
+    sys.stdout.write(json.dumps(msg, indent=ident) + end)
+    sys.stdout.flush()
 
 
-async def download(msg):
-    pass
-
-
-# Mapping of cli argument to function
-ACTIONS = {"-print": (emit_json, 0), "-pprint": (functools.partial(emit_json, ident=2), 0), "-fprint": (functools)}
+# TODO: have the option to download data using URL in payload.
+# async def download(msg):
+#     pass
 
 
 def parse_mqtt_uri(uri: str, default_scheme: tp.Literal["mqtts", "wss"] | None = None) -> MQTTConnectionInfo:
@@ -116,7 +114,7 @@ def parse_mqtt_uri(uri: str, default_scheme: tp.Literal["mqtts", "wss"] | None =
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(prog="wisfind", allow_abbrev=False)
+    parser = argparse.ArgumentParser(prog="wiswatch", allow_abbrev=False)
 
     parser.add_argument("--version", action="store_true", help="Show version information and exit.")
     parser.add_argument("-v", "--verbose", action="count", default=None, help="Increase the verbosity of log output.")
@@ -130,7 +128,7 @@ def parse_cli_args():
         ),
     )
     parser.add_argument(
-        "-0", "--null", action="store_true", help="wisfind uses NUL ('\0') characters to separate output messages."
+        "-0", "--null", action="store_true", help="Use NULL ('\\0') characters to separate output messages."
     )
     parser.add_argument(
         "uris",
@@ -138,26 +136,34 @@ def parse_cli_args():
         help="Connection and/or subscription information: [{'mqtts'|'wss'}://][user]:[password]@[host]:[port][/topic]",
     )
 
-    args, leftover = parser.parse_known_args()
+    action_group = parser.add_argument_group("Actions")
+    action_parser = action_group.add_mutually_exclusive_group(required=False)
+    action_parser.add_argument(
+        "-p",
+        "--print",
+        dest="action",
+        action="store_const",
+        const=emit_json,
+        help="The default action. Print all message payloads.",
+    )
+    action_parser.add_argument(
+        "-P",
+        "--pprint",
+        dest="action",
+        action="store_const",
+        const=functools.partial(emit_json, ident=2),
+        help="Pretty print all message payloads.",
+    )
+
+    args = parser.parse_args()
 
     if args.version:
-        print(f"{parser.prog}: {__version__}")
+        sys.stdout.write(f"{parser.prog}: {__version__}\n")
+        sys.stdout.flush()
         sys.exit()
 
     if args.verbose is not None and args.quiet:
         parser.error("Cannot specify both --verbose and --quiet!")
-
-    action = None
-    for opt in leftover:
-        if opt in ACTIONS:
-            if action is None:
-                action = opt
-            else:
-                parser.error(f"Cannot specify multiple actions. Got: {action} and {opt}.")
-        else:
-            parser.error(f"Got unknown action: {opt}")
-
-    args.action = ACTIONS
 
     default_scheme = "wss" if args.ws else "mqtts"
     args.conn_list = [parse_mqtt_uri(uri, default_scheme=default_scheme) for uri in args.uris]
@@ -167,7 +173,7 @@ def parse_cli_args():
     return args
 
 
-async def iter_mqtt(con_info: MQTTConnectionInfo) -> tp.AsyncIterator[dict]:
+async def produce_mqtt(con_info: MQTTConnectionInfo, queue: asyncio.Queue) -> tp.AsyncIterator[dict]:
     """Consume all messages from a MQTT connection and put them in a queue."""
     import aiomqtt
 
@@ -195,25 +201,17 @@ async def iter_mqtt(con_info: MQTTConnectionInfo) -> tp.AsyncIterator[dict]:
                         data = json.loads(msg.payload)
                     except ValueError:
                         LOG.info("Got non-JSON message from %s: %s", con_info["hostname"], msg.payload)
-                    else:
-                        if not isinstance(data, dict):
-                            LOG.info("Got non-JSON dictionary message from %s: %s", con_info["hostname"], data)
-                            continue
-                        yield data
+                        continue
+                    if not isinstance(data, dict):
+                        LOG.info("Got non-JSON dictionary message from %s: %s", con_info["hostname"], data)
+                        continue
+                    await queue.put(data)
         except aiomqtt.MqttError:
             LOG.warning("Lost connection to %s. Reconnecting", con_info["hostname"])
             await asyncio.sleep(3)
 
 
-T = tp.TypeVar("T")
-
-
-async def produce(stream: tp.AsyncIterator[T], queue: asyncio.Queue[T]) -> None:
-    async for msg in stream:
-        await queue.put(msg)
-
-
-async def consume(queue: asyncio.Queue[T], action) -> None:
+async def consume_messages(action, queue: asyncio.Queue) -> None:
     while True:
         msg = await queue.get()
         await action(msg)
@@ -227,8 +225,11 @@ async def loop():
         logging.basicConfig(level=log_levels[min(args.verbose or 1, 4)])
 
     msg_queue = asyncio.Queue()
-    producers = [produce(iter_mqtt(con), msg_queue) for con in args.conn_list]
-    await asyncio.gather(*producers, consume(msg_queue, args.action))
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(consume_messages(args.action, msg_queue))
+        for con in args.conn_list:
+            tg.create_task(produce_mqtt(con, msg_queue))
 
 
 if __name__ == "__main__":
