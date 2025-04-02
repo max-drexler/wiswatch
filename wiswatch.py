@@ -19,10 +19,15 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from ssl import create_default_context
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlparse
 
 import aiomqtt
+
+if TYPE_CHECKING:
+    from types import CoroutineType
 
 LOG = logging.getLogger("wiswatch")
 
@@ -52,7 +57,7 @@ class WISConsumer:
     transport: str = field(default="tcp")
 
     # Non-connection kwargs
-    include_topic: bool = field(default=False)
+    msg_callback: Callable[[dict, aiomqtt.Message, WISConsumer], CoroutineType] | None = field(default=None)
     reconnect_delay: float = field(default=3.0)
     reconnect_max: int = field(default=-1)
 
@@ -144,8 +149,8 @@ class WISConsumer:
                 if not isinstance(data, dict):
                     LOG.info("Got non-JSON dictionary message from %s: %s", self.hostname, data)
                     continue
-                if self.include_topic:
-                    data["__topic__"] = str(msg.topic)
+                if self.msg_callback is not None:
+                    await self.msg_callback(data, msg, self)
                 yield data
 
     async def consume(self, into: asyncio.Queue) -> None:
@@ -168,8 +173,9 @@ async def emit_json(msg, ident=None, end="\n"):
 
 def format_emit(fmt_str: str):
     async def emitter(msg):
-        sys.stdout.write(fmt_str.format_map(msg) + '\n')
+        sys.stdout.write(fmt_str.format_map(msg) + "\n")
         sys.stdout.flush()
+
     return emitter
 
 
@@ -196,10 +202,13 @@ def parse_cli_args():
     #     "-0", "--null", action="store_true", help="Use NULL ('\\0') characters to separate output messages."
     # )
     parser.add_argument(
-        "-T",
-        "--topic",
+        "-R",
+        "--raw-payload",
         action="store_true",
-        help="Include the topic of the message in the payload as the key `__topic__`.",
+        help=(
+            "Remove wiswatch-created payload keys: properties.__topic__, "
+            "properties.__reception_time__, and properties.__reception_host__."
+        ),
     )
     parser.add_argument("--explain", action="store_true", help="Show parsed action/connection info and exit.")
     parser.add_argument(
@@ -276,6 +285,16 @@ async def consume_messages(action, queue: asyncio.Queue) -> None:
         await action(msg)
 
 
+async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConsumer) -> None:
+    """Add additional information to the payload."""
+
+    data.get("properties", {}).update(
+        __topic__=str(msg.topic),
+        __reception_time__=datetime.now(tz=timezone.utc).isoformat(),
+        __reception_host__=client.hostname,
+    )
+
+
 async def loop():
     args = parse_cli_args()
 
@@ -284,13 +303,15 @@ async def loop():
 
     msg_queue = asyncio.Queue()
 
+    msg_clbk = add_msg_defaults if not args.raw_payload else None
+
     if args.uris:
-        cons = [WISConsumer.from_uri(uri, include_topic=args.topic) for uri in args.uris]
+        cons = [WISConsumer.from_uri(uri, msg_callback=msg_clbk) for uri in args.uris]
     else:
-        cons = [WISConsumer(include_topic=args.topic)]
+        cons = [WISConsumer(msg_callback=msg_clbk)]
 
     if args.explain:
-        sys.stdout.write(f'Action: {args.action.__name__}\n')
+        sys.stdout.write(f"Action: {args.action.__name__}\n")
         sys.stdout.write("Connection(s):\n")
         sys.stdout.write("\t\n".join(map(str, cons)))
         sys.stdout.write("\n")
