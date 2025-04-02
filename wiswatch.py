@@ -325,6 +325,14 @@ async def loop():
 
 def start():
     try:
+        # If uvloop is available, use that
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+
+    try:
         asyncio.run(loop())
     except KeyboardInterrupt:
         sys.exit(0)

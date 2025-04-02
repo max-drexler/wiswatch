@@ -5,7 +5,7 @@ description = "Consume events from WMO's Information System 2 (WIS2)."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
-keywords = []
+keywords = ["WIS2"]
 authors = [{ name = "Max Drexler", email = "mndrexler@wisc.edu" }]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -20,8 +20,14 @@ classifiers = [
 ]
 dependencies = ["aiomqtt"]
 
+[project.scripts]
+wiswatch = "wiswatch:start"
+
+[project.optional-dependencies]
+uvloop = ["uvloop"]
+
 [tool.hatch.version]
-path = "wiswatch.__version__"
+path = "wiswatch.py"
 
 [build-system]
 requires = ["hatchling"]
