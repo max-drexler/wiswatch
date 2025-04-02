@@ -18,46 +18,142 @@ import functools
 import json
 import logging
 import sys
-import typing as tp
 from ssl import create_default_context
+from dataclasses import dataclass, field, fields
 from urllib.parse import urlparse
 
-LOG = logging.getLogger(__name__)
+import aiomqtt
 
-if tp.TYPE_CHECKING:
-    MQTTScheme = tp.Literal["wss", "mqtts"]
-
-    class MQTTConnectionInfo(tp.TypedDict):
-        hostname: str
-        port: int
-        username: str
-        password: str
-        transport: tp.Literal["tcp", "websockets"]
-        topic: str
+LOG = logging.getLogger('wiswatch')
 
 
-# Connection URI information
-TRANSPORT_PER_SCHEME: dict[str, tp.Literal["websockets", "tcp"]] = {
-    "mqtts": "tcp",
-    "wss": "websockets",
-}
-
-PORT_PER_SCHEME = {"mqtts": 8883, "wss": 443}
-
-DEFAULT_PASSWORD = "everyone"  # noqa: S105
-DEFAULT_USERNAME = "everyone"
-DEFAULT_HOSTNAME = "globalbroker.meteo.fr"
+def port_per_transport(transport: str) -> int:
+    if transport.lower() in ("tcp", "mqtt", "mqtts"):
+        return 8883
+    if transport.lower() in ("websockets", "websocket", "ws", "wss"):
+        return 443
+    raise ValueError(f"Unknown transport: {transport}")
 
 
-def default_mqtt_connection(scheme: MQTTScheme | None = None) -> MQTTConnectionInfo:
-    return {
-        "hostname": DEFAULT_HOSTNAME,
-        "password": DEFAULT_PASSWORD,
-        "port": PORT_PER_SCHEME[scheme or "mqtts"],
-        "topic": "cache/a/wis2/+/data/core/#",
-        "transport": TRANSPORT_PER_SCHEME[scheme or "mqtts"],
-        "username": DEFAULT_USERNAME,
-    }
+def default_topics():
+    """By default, listen for all core (free) data."""
+    return ["cache/a/wis2/+/data/core/#"]
+
+
+@dataclass
+class WISConsumer:
+    # Connection kwargs
+    hostname: str = field(default="globalbroker.meteo.fr")
+    topics: list[str] = field(default_factory=default_topics)
+    port: int | None = field(default=None)
+    username: str = field(default="everyone")
+    password: str = field(default="everyone", repr=False)
+    transport: str = field(default="tcp")
+
+    # Non-connection kwargs
+    include_topic: bool = field(default=False)
+    reconnect_delay: float = field(default=3.0)
+    reconnect_max: int = field(default=-1)
+
+    _mqtt_client: aiomqtt.Client = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.port = port_per_transport(self.transport)
+        self._mqtt_client = self._create_client()
+
+    @classmethod
+    def from_uri(cls, uri: str, **kwargs) -> WISConsumer:
+        """Construct a consumer using a URI."""
+        try:
+            o = urlparse(uri, allow_fragments=False)
+        except (TypeError, ValueError) as e:
+            err_msg = f"Invalid URI: {uri}"
+            LOG.critical(err_msg)
+            raise ValueError(err_msg) from e
+
+        # These attributes may raise an error on access if incorrect
+        try:
+            port = o.port
+        except ValueError as e:
+            err_msg = f"URI invalid port: {uri}"
+            LOG.critical(err_msg)
+            raise ValueError(err_msg) from e
+
+        try:
+            host = o.hostname
+        except ValueError as e:
+            err_msg = f"URI invalid hostname: {uri}"
+            LOG.critical(err_msg)
+            raise ValueError(err_msg) from e
+
+        if not o.scheme or o.scheme.lower() in ("mqtt", "mqtts"):
+            transport = "tcp"
+        elif o.scheme.lower() in ("ws", "wss"):
+            transport = "websockets"
+        else:
+            err_msg = f"Invalid scheme '{o.scheme}', must be 'wss' or 'mqtts'"
+            LOG.critical(err_msg)
+            raise ValueError(err_msg)
+
+        conn_kwargs = {"transport": transport}
+        if host is not None:
+            conn_kwargs["hostname"] = host
+
+        if o.username is not None:
+            conn_kwargs["username"] = o.username
+
+        if o.password is not None:
+            conn_kwargs["password"] = o.password
+
+        if o.path.strip("/"):
+            conn_kwargs["topics"] = o.path.strip("/").split(":")
+
+        return cls(**conn_kwargs, **kwargs)
+
+    def _create_client(self) -> aiomqtt.Client:
+        """Create a MQTT client to communicate with server."""
+        return aiomqtt.Client(
+            hostname=self.hostname,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            transport=self.transport,
+            logger=LOG,
+            tls_context=create_default_context(),
+            protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
+        )
+
+    async def iter_msgs(self):
+        async with self._mqtt_client:
+            LOG.info("Connected to '%s'.", self.hostname)
+            for topic in self.topics:
+                await self._mqtt_client.subscribe(topic, qos=1)
+            async for msg in self._mqtt_client.messages:
+                if msg.payload is None or isinstance(msg.payload, (float, int)):
+                    LOG.info("Got non-JSON message from %s: %s", self.hostname, msg.payload)
+                    continue
+                try:
+                    data = json.loads(msg.payload)
+                except ValueError:
+                    LOG.info("Got non-JSON message from %s: %s", self.hostname, msg.payload)
+                    continue
+                if not isinstance(data, dict):
+                    LOG.info("Got non-JSON dictionary message from %s: %s", self.hostname, data)
+                    continue
+                if self.include_topic:
+                    data["__topic__"] = str(msg.topic)
+                yield data
+
+    async def consume(self, into: asyncio.Queue) -> None:
+        """Listens for all messages on the given connection and puts them into the queue."""
+        remaining_attempts = self.reconnect_max
+        while remaining_attempts:
+            try:
+                async for msg in self.iter_msgs():
+                    await into.put(msg)
+            except aiomqtt.MqttError:
+                LOG.warning("Lost connection to %s. Reconnecting", self.hostname)
+                await asyncio.sleep(self.reconnect_delay)
 
 
 async def emit_json(msg, ident=None, end="\n"):
@@ -71,64 +167,20 @@ async def emit_json(msg, ident=None, end="\n"):
 #     pass
 
 
-def parse_mqtt_uri(uri: str, default_scheme: tp.Literal["mqtts", "wss"] | None = None) -> MQTTConnectionInfo:
-    """Parses the URI and return the kwargs to make the connection using ``aiomqtt.Client``."""
-    try:
-        o = urlparse(uri, allow_fragments=False)
-    except (TypeError, ValueError) as e:
-        err_msg = f"Invalid URI: {uri}"
-        LOG.critical(err_msg)
-        raise ValueError(err_msg) from e
-
-    if not o.scheme:
-        transport = TRANSPORT_PER_SCHEME[default_scheme or "mqtts"]
-    elif o.scheme not in PORT_PER_SCHEME:
-        err_msg = f"Invalid scheme '{o.scheme}', must be one of {', '.join(PORT_PER_SCHEME.keys())}."
-        LOG.critical(err_msg)
-        raise ValueError(err_msg)
-    else:
-        transport = TRANSPORT_PER_SCHEME[o.scheme]
-
-    try:
-        port = o.port
-    except ValueError as e:
-        err_msg = f"URI invalid port: {uri}"
-        LOG.critical(err_msg)
-        raise ValueError(err_msg) from e
-
-    try:
-        host = o.hostname
-    except ValueError as e:
-        err_msg = f"URI invalid hostname: {uri}"
-        LOG.critical(err_msg)
-        raise ValueError(err_msg) from e
-
-    return {
-        "transport": transport,
-        "password": o.password if o.password is not None else DEFAULT_PASSWORD,
-        "username": o.username if o.username is not None else DEFAULT_USERNAME,
-        "port": port if port is not None else PORT_PER_SCHEME[o.scheme or "mqtts"],
-        "hostname": host if host is not None else DEFAULT_HOSTNAME,
-        "topic": o.path.removeprefix("/"),
-    }
-
-
 def parse_cli_args():
     parser = argparse.ArgumentParser(prog="wiswatch", allow_abbrev=False)
 
-    parser.add_argument("--version", action="store_true", help="Show version information and exit.")
+    parser.add_argument("-V", "--version", action="store_true", help="Show version information and exit.")
     parser.add_argument("-v", "--verbose", action="count", default=None, help="Increase the verbosity of log output.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Disable all log output to stderr.")
     parser.add_argument(
-        "--ws",
-        action="store_true",
-        help=(
-            "URIs w/o a scheme default to MQTT over WebSocket. Alternatively, can be"
-            "specified on a per-uri basis using the wss:// scheme."
-        ),
+        "-0", "--null", action="store_true", help="Use NULL ('\\0') characters to separate output messages."
     )
     parser.add_argument(
-        "-0", "--null", action="store_true", help="Use NULL ('\\0') characters to separate output messages."
+        "-T",
+        "--topic",
+        action="store_true",
+        help="Include the topic of the message in the payload as the key `__topic__`.",
     )
     parser.add_argument(
         "uris",
@@ -168,50 +220,7 @@ def parse_cli_args():
     if args.action is None:
         args.action = emit_json
 
-    default_scheme = "wss" if args.ws else "mqtts"
-    args.conn_list = [parse_mqtt_uri(uri, default_scheme=default_scheme) for uri in args.uris]
-    if not args.conn_list:
-        args.conn_list = [default_mqtt_connection(default_scheme)]
-
     return args
-
-
-async def produce_mqtt(con_info: MQTTConnectionInfo, queue: asyncio.Queue) -> tp.AsyncIterator[dict]:
-    """Consume all messages from a MQTT connection and put them in a queue."""
-    import aiomqtt
-
-    client = aiomqtt.Client(
-        hostname=con_info["hostname"],
-        port=con_info["port"],
-        username=con_info["username"],
-        password=con_info["password"],
-        transport=con_info["transport"],
-        logger=LOG,
-        tls_context=create_default_context(),
-        protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
-    )
-
-    while True:
-        try:
-            async with client:
-                LOG.info("Connected to '%s'.", con_info["hostname"])
-                await client.subscribe(con_info["topic"], qos=1)
-                async for msg in client.messages:
-                    if msg.payload is None or isinstance(msg.payload, (float, int)):
-                        LOG.info("Got non-JSON message from %s: %s", con_info["hostname"], msg.payload)
-                        continue
-                    try:
-                        data = json.loads(msg.payload)
-                    except ValueError:
-                        LOG.info("Got non-JSON message from %s: %s", con_info["hostname"], msg.payload)
-                        continue
-                    if not isinstance(data, dict):
-                        LOG.info("Got non-JSON dictionary message from %s: %s", con_info["hostname"], data)
-                        continue
-                    await queue.put(data)
-        except aiomqtt.MqttError:
-            LOG.warning("Lost connection to %s. Reconnecting", con_info["hostname"])
-            await asyncio.sleep(3)
 
 
 async def consume_messages(action, queue: asyncio.Queue) -> None:
@@ -229,14 +238,23 @@ async def loop():
 
     msg_queue = asyncio.Queue()
 
+    if args.uris:
+        cons = [WISConsumer.from_uri(uri, include_topic=args.topic) for uri in args.uris]
+    else:
+        cons = [WISConsumer(include_topic=args.topic)]
+
     async with asyncio.TaskGroup() as tg:
         tg.create_task(consume_messages(args.action, msg_queue))
-        for con in args.conn_list:
-            tg.create_task(produce_mqtt(con, msg_queue))
+        for con in cons:
+            tg.create_task(con.consume(msg_queue))
 
 
-if __name__ == "__main__":
+def start():
     try:
         asyncio.run(loop())
     except KeyboardInterrupt:
         sys.exit(0)
+
+
+if __name__ == "__main__":
+    start()
