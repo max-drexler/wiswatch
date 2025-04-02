@@ -115,7 +115,7 @@ class WISConsumer:
             conn_kwargs["password"] = o.password
 
         if o.path.strip("/"):
-            conn_kwargs["topics"] = o.path.strip("/").split(":")
+            conn_kwargs["topics"] = o.path.strip("/").split("/:/")
 
         return cls(**conn_kwargs, **kwargs)
 
