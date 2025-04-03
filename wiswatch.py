@@ -8,6 +8,9 @@ Organization Information System (WIS2).
 
 from __future__ import annotations
 
+import contextlib
+import os
+
 __version__ = "0.1.0"
 __author__ = "Max Drexler"
 __email__ = "mndrexler@wisc.edu"
@@ -21,13 +24,31 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from ssl import create_default_context
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, AsyncContextManager, AsyncIterator, Callable
 from urllib.parse import urlparse
 
+import aiohttp
 import aiomqtt
 
 if TYPE_CHECKING:
     from types import CoroutineType
+    from typing import Any, Mapping, TypedDict
+
+    WisNotifType = dict[str, Any]
+
+    # WISDispatcher types
+    StatelessContext = Callable[[], AsyncContextManager[None]]
+    StatefullContext = Callable[[], AsyncContextManager[Mapping[str, object]]]
+    ContextFunction = StatelessContext | StatefullContext
+
+    StatelessDispatch = Callable[[WisNotifType], CoroutineType]
+    StatefullDispatch = Callable[[Mapping[str, Any], WisNotifType], CoroutineType]
+    DispatchFunction = StatelessDispatch | StatefullDispatch
+
+    # Context when downloading WIS2 data
+    class DownloadContext(TypedDict):
+        session: aiohttp.ClientSession
+
 
 LOG = logging.getLogger("wiswatch")
 
@@ -132,7 +153,7 @@ class WISConsumer:
             protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
         )
 
-    async def iter_msgs(self):
+    async def iter_msgs(self) -> AsyncIterator[WisNotifType]:
         async with self._mqtt_client:
             LOG.info("Connected to '%s'.", self.hostname)
             for topic in self.topics:
@@ -153,35 +174,194 @@ class WISConsumer:
                     await self.msg_callback(data, msg, self)
                 yield data
 
-    async def consume(self, into: asyncio.Queue) -> None:
+    async def consume_into(self, into: asyncio.Queue[WisNotifType]) -> None:
         """Listens for all messages on the given connection and puts them into the queue."""
         remaining_attempts = self.reconnect_max
         while remaining_attempts:
             try:
                 async for msg in self.iter_msgs():
+                    LOG.debug("Got message: %s", msg)
                     await into.put(msg)
             except aiomqtt.MqttError:
                 LOG.warning("Lost connection to %s. Reconnecting", self.hostname)
                 await asyncio.sleep(self.reconnect_delay)
 
 
-async def emit_json(msg, ident=None, end="\n"):
-    """Default action. Print json string of message."""
-    sys.stdout.write(json.dumps(msg, indent=ident) + end)
-    sys.stdout.flush()
+@contextlib.asynccontextmanager
+async def http_session() -> AsyncIterator[DownloadContext]:
+    """A context manager for WISDispatcher that yields a http (eventually ftp also) client."""
+    async with aiohttp.ClientSession() as session:
+        yield {"session": session}
 
 
-def format_emit(fmt_str: str):
-    async def emitter(msg):
-        sys.stdout.write(fmt_str.format_map(msg) + "\n")
-        sys.stdout.flush()
+async def wis2_data_download(session: aiohttp.ClientSession, directory: str, msg: dict) -> None:
+    """Download the data a WIS2 notification is describing."""
+    props = msg.get("properties")
+    if props is None:
+        LOG.warning("Invalid WIS2 message: missing 'properties' key! %s", msg)
+        return
 
-    return emitter
+    inline = props.get("content")
+    if inline is not None:
+        LOG.critical("Inline download not yet supported!")
+        return
+
+    links = msg.get("links")
+    if links is None:
+        LOG.warning("Invalid WIS2 message: missing 'links' key! %s", msg)
+        return
+    if not isinstance(links, list):
+        LOG.warning("Invalid WIS2 message: 'links' value is not list, got %s", type(links).__name__)
+        return
+
+    # Find canonical link
+    rel_link = None
+    for link in links:
+        if not isinstance(link, dict):
+            LOG.warning("Invalid WIS2 message: link %s is %s not dict", link, type(link).__name__)
+            # Could continue iterating, but why support non-conformant messages?
+            return
+
+        relation = link.get("rel")
+        if relation in ("update", "deletion"):
+            LOG.info("wiswatch doesn't currently support update/deletion notifications")
+            # TODO: support updating files, optionally support deleting old files.
+            return
+        if relation == "canonical":
+            if rel_link is not None:
+                LOG.warning("WIS2 notification has multiple canonical links, defaulting to the last one, %s", links)
+            rel_link = link
+
+    if rel_link is None:
+        # Couldn't find canonical link
+        LOG.warning("Invalid WIS2 message: no canonical link in 'links' %s", links)
+        return
+
+    url = rel_link.get("href")
+    if url is None or not isinstance(url, str) or not url.startswith(("http://", "https://", "ftp://", "sftp://")):
+        LOG.warning("Invalid WIS2 message: non-valid canonical url '%s'", url)
+        return
+
+    try:
+        o = urlparse(url)
+    except (TypeError, ValueError) as e:
+        LOG.warning("Invalid WIS2 message: canonical url couldn't be parsed '%s'", str(e))
+        return
+
+    # Stream file remote content to file
+    download_file = os.path.join(directory, os.path.basename(o.path))
+    if os.path.isfile(download_file):
+        LOG.critical("WIS2 data file '%s' already exists!", download_file)
+        return
+
+    # TODO: suppress SIGINT to avoid file corruption
+    with open(download_file, "wb") as f:  # noqa: ASYNC101 (might need to come back to this)
+        async with session.get(url) as resp:
+            async for chunk in resp.content.iter_chunked(2048):
+                f.write(chunk)
+
+    # Verify integrity of file
+    #
 
 
-# TODO: have the option to download data using URL in payload.
-# async def download(msg):
-#     pass
+@dataclass
+class WISDispatcher:
+    """Dispatch WIS2 messages to an async def function, optionally, with context.
+
+    ``dispatch_function`` must be an asyc def function that accepts a WIS2 message (dictionary) and
+    context in the form of a dictionary (if ``context_function`` is used and returns a non-None value).
+
+    ``context_function`` is optional. If used, it should be an async context manager. Its context
+    is established before any message is dispatched and torn down before program exit.
+    ``context_function`` can yield a dictionary that will be passed to the ``dispatch_function``
+    as an argument, or None if ``dispatch_function`` doesn't need context.
+
+    Example:
+
+    ```python
+    from contextlib import asynccontextmanager
+    from typing import AsyncContextManager, TypedDict
+
+
+    # To ensure types are valid
+    class MyContext(TypedDict):
+        session: aiohttp.ClientSession
+
+
+    @asynccontextmanager
+    def my_context() -> AsyncIterator[MyContext]:
+        with aiohttp.session() as sesh:
+            yield {"session": sesh}
+
+
+    async def my_dispatch(context: MyContext, message: dict) -> None:
+        await context["session"].get(message["url"])
+
+
+    dispatcher = WISDispatcher(my_dispatch, my_context)
+    ```
+    """
+
+    dispatch_function: DispatchFunction
+    context_function: ContextFunction = field(default=lambda: contextlib.nullcontext(None))
+
+    def __post_init__(self) -> None:
+        LOG.debug("Created %s", self)
+
+    async def dispatch_from(self, _from: asyncio.Queue[WisNotifType]) -> None:
+        """Dispatch WIS2 notification received from the queue to the action function."""
+
+        async with self.context_function() as context:
+            # If no context is given, don't pass to dispatch function
+            f = self.dispatch_function if context is None else functools.partial(self.dispatch_function, context)
+
+            while True:
+                msg = await _from.get()
+                LOG.debug("%s got message", self)
+                await f(msg)
+
+    ## Built-in dispatch functions ##
+
+    @classmethod
+    def print_messages(cls, indent: int | None = None, end: str = "\n") -> WISDispatcher:
+        """WISDispatcher that prints JSON-encoded payloads to stdout."""
+
+        async def emit_json(msg: WisNotifType, ident=None, end="\n"):
+            """Default action. Print json string of message."""
+            sys.stdout.write(json.dumps(msg, indent=ident) + end)
+            sys.stdout.flush()
+
+        return cls(
+            functools.partial(emit_json, ident=indent, end=end),
+        )
+
+    @classmethod
+    def fprint_messages(cls, format_str: str) -> WISDispatcher:
+        """WISDispatcher that uses WIS2 notification payloads to populate a format string, and prints that."""
+
+        async def fmt_print(msg: WisNotifType):
+            sys.stdout.write(format_str.format_map(msg) + "\n")
+            sys.stdout.flush()
+
+        return cls(fmt_print)
+
+    @classmethod
+    def download_data(cls, directory: str) -> WISDispatcher:
+        if not os.path.isdir(os.path.abspath(directory)):
+            msg = f"Directory {directory} doesn't exist!"
+            LOG.critical(msg)
+            raise OSError(msg)
+
+        # This is a little too much shenanigans for my taste, will have to refactor eventually
+        #   => wrapper inside a classmethod that calls other method...
+        async def download_wrapper(context: DownloadContext, msg: WisNotifType):
+            await wis2_data_download(context["session"], directory, msg)
+
+        return cls(
+            download_wrapper,
+            http_session,
+        )
+
 
 WISWATCH_EPILOG = """For more information on WIS2, see the following:
     - Topic hierarchy: https://github.com/wmo-im/wis2-topic-hierarchy/tree/main
@@ -239,21 +419,20 @@ def parse_cli_args():
         "Actions", "Choose one action to perform on all messages. Default is --print"
     )
     action_parser = action_group.add_mutually_exclusive_group(required=False)
+
     # Follow these kwargs for adding an action that doesn't accept args
     action_parser.add_argument(
-        "-p",
         "--print",
         dest="action",
         action="store_const",
-        const=emit_json,
+        const=WISDispatcher.print_messages(),
         help="Print JSON-serialized message payloads.",
     )
     action_parser.add_argument(
-        "-P",
         "--pprint",
         dest="action",
         action="store_const",
-        const=functools.partial(emit_json, ident=2),
+        const=WISDispatcher.print_messages(indent=2),
         help="Pretty print message payloads.",
     )
     # Follow these kwargs for adding an action that accepts arguments
@@ -262,27 +441,26 @@ def parse_cli_args():
         "--fprint",
         metavar="FSTRING",
         dest="action",
-        type=format_emit,
+        type=WISDispatcher.fprint_messages,
         help="Print a string based on keys in the payload. E.g. '{properties.data_id}:{properties.start_time}'",
+    )
+    action_parser.add_argument(
+        "--download",
+        metavar="DIR",
+        dest="action",
+        type=WISDispatcher.download_data,
+        help="Download the file data described in each WIS2 payload to a directory. File name is automatically determined from the payload.",
     )
 
     args = parser.parse_args()
 
     if args.version:
-        sys.stdout.write(f"{parser.prog}: {__version__}\n")
-        sys.stdout.flush()
-        sys.exit()
+        parser.exit(0, f"{parser.prog}: {__version__}")
 
     if args.action is None:
-        args.action = emit_json
+        args.action = WISDispatcher.print_messages()
 
     return args
-
-
-async def consume_messages(action, queue: asyncio.Queue) -> None:
-    while True:
-        msg = await queue.get()
-        await action(msg)
 
 
 async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConsumer) -> None:
@@ -311,16 +489,16 @@ async def loop():
         cons = [WISConsumer(msg_callback=msg_clbk)]
 
     if args.explain:
-        sys.stdout.write(f"Action: {args.action.__name__}\n")
+        sys.stdout.write(f"Action: {args.action}\n")
         sys.stdout.write("Connection(s):\n")
         sys.stdout.write("\t\n".join(map(str, cons)))
         sys.stdout.write("\n")
         sys.exit(0)
 
     async with asyncio.TaskGroup() as tg:
-        tg.create_task(consume_messages(args.action, msg_queue))
+        tg.create_task(args.action.dispatch_from(msg_queue))
         for con in cons:
-            tg.create_task(con.consume(msg_queue))
+            tg.create_task(con.consume_into(msg_queue))
 
 
 def start():
@@ -339,4 +517,4 @@ def start():
 
 
 if __name__ == "__main__":
-    start()
+    sys.exit(start())
