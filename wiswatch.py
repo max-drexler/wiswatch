@@ -445,6 +445,7 @@ def parse_cli_args():
         help="Print a string based on keys in the payload. E.g. '{properties.data_id}:{properties.start_time}'",
     )
     action_parser.add_argument(
+        "-D",
         "--download",
         metavar="DIR",
         dest="action",
