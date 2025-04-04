@@ -1,15 +1,29 @@
 #! /usr/bin/env python3
 
-"""wiswatch
+"""wiswatch: A CLI to consume data notifications from WMO's Information System 2.0 (WIS2).
 
-A CLI client to consume real-time geospatial data from the World Meteorological
-Organization Information System (WIS2).
+Copyright (C) 2025 Max Drexler
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
 from __future__ import annotations
-
-import contextlib
-import os
 
 __version__ = "0.1.0"
 __author__ = "Max Drexler"
@@ -17,9 +31,13 @@ __email__ = "mndrexler@wisc.edu"
 
 import argparse
 import asyncio
+import base64
+import contextlib
 import functools
+import gzip
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -62,23 +80,23 @@ def port_per_transport(transport: str) -> int:
     raise ValueError(msg)
 
 
-def default_topics():
-    """By default, listen for all core (free) data."""
+def all_open_data():
+    """Topics for receiving all 'core' (free/open) data."""
     return ["cache/a/wis2/+/data/core/#"]
 
 
 @dataclass
-class WISConsumer:
+class WISConnection:
     # Connection kwargs
     hostname: str = field(default="globalbroker.meteo.fr")
-    topics: list[str] = field(default_factory=default_topics)
+    topics: list[str] = field(default_factory=all_open_data)
     port: int | None = field(default=None)
     username: str = field(default="everyone")
     password: str = field(default="everyone", repr=False)
     transport: str = field(default="tcp")
 
     # Non-connection kwargs
-    msg_callback: Callable[[dict, aiomqtt.Message, WISConsumer], CoroutineType] | None = field(default=None)
+    msg_callback: Callable[[dict, aiomqtt.Message, WISConnection], CoroutineType] | None = field(default=None)
     reconnect_delay: float = field(default=3.0)
     reconnect_max: int = field(default=-1)
 
@@ -89,7 +107,7 @@ class WISConsumer:
         self._mqtt_client = self._create_client()
 
     @classmethod
-    def from_uri(cls, uri: str, **kwargs) -> WISConsumer:
+    def from_uri(cls, uri: str, **kwargs) -> WISConnection:
         """Construct a consumer using a URI."""
         try:
             o = urlparse(uri, allow_fragments=False)
@@ -382,7 +400,7 @@ def parse_cli_args():
     #     "-0", "--null", action="store_true", help="Use NULL ('\\0') characters to separate output messages."
     # )
     parser.add_argument(
-        "-R",
+        "-r",
         "--raw-payload",
         action="store_true",
         help=(
@@ -416,19 +434,13 @@ def parse_cli_args():
     # Only allowed to choose one action
     # args.action must be a coroutine that accepts one argument, the message.
     action_group = parser.add_argument_group(
-        "Actions", "Choose one action to perform on all messages. Default is --print"
+        "Actions", "An action to perform on each message. Default is to print to stdout."
     )
     action_parser = action_group.add_mutually_exclusive_group(required=False)
 
     # Follow these kwargs for adding an action that doesn't accept args
     action_parser.add_argument(
-        "--print",
-        dest="action",
-        action="store_const",
-        const=WISDispatcher.print_messages(),
-        help="Print JSON-serialized message payloads.",
-    )
-    action_parser.add_argument(
+        "-P",
         "--pprint",
         dest="action",
         action="store_const",
@@ -442,7 +454,7 @@ def parse_cli_args():
         metavar="FSTRING",
         dest="action",
         type=WISDispatcher.fprint_messages,
-        help="Print a string based on keys in the payload. E.g. '{properties.data_id}:{properties.start_time}'",
+        help="Print a formatted string based on keys in the payload. E.g. '{properties.data_id}:{properties.start_time}'",
     )
     action_parser.add_argument(
         "-D",
@@ -464,7 +476,7 @@ def parse_cli_args():
     return args
 
 
-async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConsumer) -> None:
+async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConnection) -> None:
     """Add additional information to the payload."""
 
     data.get("properties", {}).update(
@@ -485,9 +497,9 @@ async def loop():
     msg_clbk = add_msg_defaults if not args.raw_payload else None
 
     if args.uris:
-        cons = [WISConsumer.from_uri(uri, msg_callback=msg_clbk) for uri in args.uris]
+        cons = [WISConnection.from_uri(uri, msg_callback=msg_clbk) for uri in args.uris]
     else:
-        cons = [WISConsumer(msg_callback=msg_clbk)]
+        cons = [WISConnection(msg_callback=msg_clbk)]
 
     if args.explain:
         sys.stdout.write(f"Action: {args.action}\n")
@@ -496,6 +508,7 @@ async def loop():
         sys.stdout.write("\n")
         sys.exit(0)
 
+    # TODO: make this backward-compatible with older python versions
     async with asyncio.TaskGroup() as tg:
         tg.create_task(args.action.dispatch_from(msg_queue))
         for con in cons:
@@ -511,6 +524,7 @@ def start():
     except ImportError:
         pass
 
+    # TODO: signal handling
     try:
         asyncio.run(loop())
     except KeyboardInterrupt:
