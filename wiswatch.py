@@ -42,7 +42,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from ssl import create_default_context
-from typing import TYPE_CHECKING, AsyncContextManager, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncContextManager, AsyncIterator, Callable
 from urllib.parse import urlparse
 
 import aiohttp
@@ -50,17 +50,15 @@ import aiomqtt
 
 if TYPE_CHECKING:
     from types import CoroutineType
-    from typing import Any, Mapping, TypedDict
-
-    WisNotifType = dict[str, Any]
+    from typing import Mapping, TypedDict
 
     # WISDispatcher types
     StatelessContext = Callable[[], AsyncContextManager[None]]
     StatefullContext = Callable[[], AsyncContextManager[Mapping[str, object]]]
     ContextFunction = StatelessContext | StatefullContext
 
-    StatelessDispatch = Callable[[WisNotifType], CoroutineType]
-    StatefullDispatch = Callable[[Mapping[str, Any], WisNotifType], CoroutineType]
+    StatelessDispatch = Callable[["WISMessage"], CoroutineType]
+    StatefullDispatch = Callable[[Mapping[str, Any], "WISMessage"], CoroutineType]
     DispatchFunction = StatelessDispatch | StatefullDispatch
 
     # Context when downloading WIS2 data
@@ -69,6 +67,125 @@ if TYPE_CHECKING:
 
 
 LOG = logging.getLogger("wiswatch")
+
+
+class WNMConformanceError(Exception):
+    """An MQTT payload wasn't conformant with the WNM specification
+
+    https://wmo-im.github.io/wis2-notification-message/standard/wis2-notification-message-STABLE.html
+    """
+
+
+class WISMessage(dict[str, Any]):
+    """A bare-bones wrapper around a dictionary that provides:
+        - lazy validation
+        - improved formatting
+        - helpful instance methods
+    specifically for WIS2 Notification Messages.
+    """
+
+    async def iter_data(
+        self, session: aiohttp.ClientSession | None = None, chunk_size: int = 2048
+    ) -> AsyncIterator[bytes]:
+        """Iterate the actual remote data described by this WISMessage.
+
+        This is either done by streaming byte content from the HTTP/FTP canonical url,
+        or yielding the data directly if it is inlined in the notification.
+
+        Args:
+            session (aiohttp.ClientSession | None): An asynchronous HTTP client, one will be created if not specified.
+            Recommended to construct your own client for better performance. Default None.
+            chunk_size (int): Size of byte content to yield. Default 2048.
+
+        Yields:
+            bytes: Chunks of the data content described by the WIS2 Notification Message.
+        """
+        inline = self.get("properties", {}).get("content")
+        if inline:
+            if not isinstance(inline, dict):
+                err = f"Invalid WIS2 message: 'properties.content' is {type(inline).__name__}, expceted a dict"
+                LOG.warning(err)
+                raise ValueError(err)
+            encoding = str(inline.get("encoding", "utf-8")).lower()
+            content = inline.get("value")
+            if content is None:
+                # Undefined in WNM standard, could raise an error, or fallback on links
+                pass
+            elif encoding == "utf-8":
+                b = content
+            elif encoding == "gzip":
+                b = gzip.decompress(content)
+            elif encoding == "base64":
+                b = base64.b64decode(content)
+            else:
+                err = "Invalid WIS2 message: Unknnown 'properties.content.encoding' '{encoding}', expected 'utf-8', 'gzip', or' base64'"
+                LOG.warning(err)
+                raise ValueError(err)
+
+            for i in range(0, len(b), chunk_size):
+                yield b[i:i]
+            return
+
+        links = self.get("links")
+        if links is None:
+            err = f"Invalid WIS2 message: missing 'links' key! {self}"
+            LOG.warning(err)
+            raise ValueError(err)
+        if not isinstance(links, list):
+            err = f"Invalid WIS2 message: 'links' value is not list, got {type(links).__name__}"
+            LOG.warning(err)
+            raise TypeError(err)
+
+        # Find canonical link
+        rel_link = None
+        for link in links:
+            if not isinstance(link, dict):
+                err = f"Invalid WIS2 message: link {link} is {type(link).__name__} not dict"
+                LOG.warning(err)
+                raise TypeError(err)
+                # Could continue iterating links, but why support non-conformant messages?
+
+            if link.get("rel") == "canonical":
+                rel_link = link
+                break
+        if rel_link is None:
+            # Couldn't find canonical link
+            err = f"Invalid WIS2 message: no canonical link in 'links' {links}"
+            LOG.warning(err)
+            raise ValueError(err)
+
+        url = rel_link.get("href")
+        if url is None or not isinstance(url, str):
+            err = f"Invalid WIS2 message: canonical link missing 'href' key '{rel_link}'"
+            LOG.warning(err)
+            raise ValueError(err)
+
+        try:
+            o = urlparse(url)
+        except (TypeError, ValueError) as e:
+            err = f"Invalid WIS2 message: canonical url '{url}' couldn't be parsed"
+            LOG.warning(err)
+            raise ValueError(err) from e
+
+        if o.scheme not in ("http", "https", "ftp", "sftp"):
+            err = f"Invalid WIS2 message: canonical url '{url}' not http/s or s/ftp!"
+            LOG.warning(err)
+            raise ValueError(err)
+
+        session = aiohttp.ClientSession() if session is None else session
+        async with session.get(url) as resp:
+            async for chunk in resp.content.iter_chunked(chunk_size):
+                yield chunk
+
+
+class WISMessageDecoder(json.JSONDecoder):
+    def decode(self, s: str) -> Any:
+        decode = super().decode(s)
+        if isinstance(decode, dict) and all(
+            req_key in decode for req_key in ("id", "links", "properties", "geometry", "type")
+        ):
+            return WISMessage(decode)
+        return decode
 
 
 def port_per_transport(transport: str) -> int:
@@ -96,7 +213,9 @@ class WISConnection:
     transport: str = field(default="tcp")
 
     # Non-connection kwargs
-    msg_callback: Callable[[dict, aiomqtt.Message, WISConnection], CoroutineType] | None = field(default=None)
+    msg_callback: Callable[[WISMessage, aiomqtt.Message, WISConnection], CoroutineType] | None = field(
+        default=None, repr=False
+    )
     reconnect_delay: float = field(default=3.0)
     reconnect_max: int = field(default=-1)
 
@@ -171,38 +290,44 @@ class WISConnection:
             protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
         )
 
-    async def iter_msgs(self) -> AsyncIterator[WisNotifType]:
+    async def iter_msgs(self) -> AsyncIterator[WISMessage]:
+        """Asynchronously iterate over all messages received on this connection."""
         async with self._mqtt_client:
-            LOG.info("Connected to '%s'.", self.hostname)
+            LOG.debug("%s connected", self)
             for topic in self.topics:
                 await self._mqtt_client.subscribe(topic, qos=1)
+
             async for msg in self._mqtt_client.messages:
                 if msg.payload is None or isinstance(msg.payload, (float, int)):
-                    LOG.info("Got non-JSON message from %s: %s", self.hostname, msg.payload)
+                    LOG.info("%s got non-JSON MQTT payload", self)
                     continue
                 try:
-                    data = json.loads(msg.payload)
+                    data = json.loads(msg.payload, cls=WISMessageDecoder)
                 except ValueError:
-                    LOG.info("Got non-JSON message from %s: %s", self.hostname, msg.payload)
+                    LOG.info("%s got non-JSON MQTT payload", self)
                     continue
-                if not isinstance(data, dict):
-                    LOG.info("Got non-JSON dictionary message from %s: %s", self.hostname, data)
+
+                if not isinstance(data, WISMessage):
+                    LOG.warning("%s got non-WNM MQTT payload: %s", self, data)
                     continue
                 if self.msg_callback is not None:
                     await self.msg_callback(data, msg, self)
                 yield data
 
-    async def consume_into(self, into: asyncio.Queue[WisNotifType]) -> None:
+    async def consume_into(self, into: asyncio.Queue[WISMessage]) -> None:
         """Listens for all messages on the given connection and puts them into the queue."""
         remaining_attempts = self.reconnect_max
         while remaining_attempts:
             try:
                 async for msg in self.iter_msgs():
-                    LOG.debug("Got message: %s", msg)
+                    LOG.debug("%s got message: %s", self, msg)
                     await into.put(msg)
             except aiomqtt.MqttError:
-                LOG.warning("Lost connection to %s. Reconnecting", self.hostname)
+                LOG.warning("%s lost connection. Reconnecting in %d.", self, self.reconnect_delay)
                 await asyncio.sleep(self.reconnect_delay)
+
+    def __str__(self) -> str:
+        return f"WISConnection({self.username}@{self.hostname}, topics='{'\', \''.join(self.topics)}')"
 
 
 @contextlib.asynccontextmanager
@@ -326,7 +451,7 @@ class WISDispatcher:
     def __post_init__(self) -> None:
         LOG.debug("Created %s", self)
 
-    async def dispatch_from(self, _from: asyncio.Queue[WisNotifType]) -> None:
+    async def dispatch_from(self, _from: asyncio.Queue[WISMessage]) -> None:
         """Dispatch WIS2 notification received from the queue to the action function."""
 
         async with self.context_function() as context:
@@ -335,7 +460,6 @@ class WISDispatcher:
 
             while True:
                 msg = await _from.get()
-                LOG.debug("%s got message", self)
                 await f(msg)
 
     ## Built-in dispatch functions ##
@@ -344,7 +468,7 @@ class WISDispatcher:
     def print_messages(cls, indent: int | None = None, end: str = "\n") -> WISDispatcher:
         """WISDispatcher that prints JSON-encoded payloads to stdout."""
 
-        async def emit_json(msg: WisNotifType, ident=None, end="\n"):
+        async def emit_json(msg: WISMessage, ident=None, end="\n"):
             """Default action. Print json string of message."""
             sys.stdout.write(json.dumps(msg, indent=ident) + end)
             sys.stdout.flush()
@@ -357,7 +481,7 @@ class WISDispatcher:
     def fprint_messages(cls, format_str: str) -> WISDispatcher:
         """WISDispatcher that uses WIS2 notification payloads to populate a format string, and prints that."""
 
-        async def fmt_print(msg: WisNotifType):
+        async def fmt_print(msg: WISMessage):
             sys.stdout.write(format_str.format_map(msg) + "\n")
             sys.stdout.flush()
 
@@ -372,7 +496,7 @@ class WISDispatcher:
 
         # This is a little too much shenanigans for my taste, will have to refactor eventually
         #   => wrapper inside a classmethod that calls other method...
-        async def download_wrapper(context: DownloadContext, msg: WisNotifType):
+        async def download_wrapper(context: DownloadContext, msg: WISMessage):
             await wis2_data_download(context["session"], directory, msg)
 
         return cls(
