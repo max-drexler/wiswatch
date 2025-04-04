@@ -84,6 +84,28 @@ class WISMessage(dict[str, Any]):
     specifically for WIS2 Notification Messages.
     """
 
+    @classmethod
+    def from_json(cls, s: str | bytes | bytearray) -> WISMessage:
+        def _decode_wnm(d: dict):
+            """Just turn the top-level dictionary into a WISMessage."""
+            if all(req_key in d for req_key in ("id", "links", "properties", "geometry", "type")):
+                return cls(**d)
+            return d
+
+        try:
+            obj = json.loads(s, object_hook=_decode_wnm)
+        except ValueError as e:
+            err = 'Non-json message'
+            raise WNMConformanceError(err) from e
+
+        # this happens for valid json where no object is turned into a WISMessage in ``_decode_wnm``
+        if not isinstance(obj, cls):
+            # TODO: better error message
+            err = "Missing a required key"
+            raise WNMConformanceError(err)
+
+        return obj
+
     async def iter_data(
         self, session: aiohttp.ClientSession | None = None, chunk_size: int = 2048
     ) -> AsyncIterator[bytes]:
@@ -176,16 +198,6 @@ class WISMessage(dict[str, Any]):
         async with session.get(url) as resp:
             async for chunk in resp.content.iter_chunked(chunk_size):
                 yield chunk
-
-
-class WISMessageDecoder(json.JSONDecoder):
-    def decode(self, s: str) -> Any:
-        decode = super().decode(s)
-        if isinstance(decode, dict) and all(
-            req_key in decode for req_key in ("id", "links", "properties", "geometry", "type")
-        ):
-            return WISMessage(decode)
-        return decode
 
 
 def port_per_transport(transport: str) -> int:
@@ -302,17 +314,14 @@ class WISConnection:
                     LOG.info("%s got non-JSON MQTT payload", self)
                     continue
                 try:
-                    data = json.loads(msg.payload, cls=WISMessageDecoder)
-                except ValueError:
-                    LOG.info("%s got non-JSON MQTT payload", self)
+                    wnm = WISMessage.from_json(msg.payload)
+                except WNMConformanceError as e:
+                    LOG.info("%s got non-conformant MQTT payload: %s", self, str(e))
                     continue
 
-                if not isinstance(data, WISMessage):
-                    LOG.warning("%s got non-WNM MQTT payload: %s", self, data)
-                    continue
                 if self.msg_callback is not None:
-                    await self.msg_callback(data, msg, self)
-                yield data
+                    await self.msg_callback(wnm, msg, self)
+                yield wnm
 
     async def consume_into(self, into: asyncio.Queue[WISMessage]) -> None:
         """Listens for all messages on the given connection and puts them into the queue."""
