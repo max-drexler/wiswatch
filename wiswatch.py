@@ -477,14 +477,12 @@ class WISDispatcher:
     def print_messages(cls, indent: int | None = None, end: str = "\n") -> WISDispatcher:
         """WISDispatcher that prints JSON-encoded payloads to stdout."""
 
-        async def emit_json(msg: WISMessage, ident=None, end="\n"):
+        async def print_wis(msg: WISMessage):
             """Default action. Print json string of message."""
-            sys.stdout.write(json.dumps(msg, indent=ident) + end)
+            sys.stdout.write(json.dumps(msg, indent=indent) + end)
             sys.stdout.flush()
 
-        return cls(
-            functools.partial(emit_json, ident=indent, end=end),
-        )
+        return cls(print_wis)
 
     @classmethod
     def fprint_messages(cls, format_str: str) -> WISDispatcher:
