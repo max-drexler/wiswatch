@@ -32,33 +32,35 @@ __email__ = "mndrexler@wisc.edu"
 import argparse
 import asyncio
 import base64
-import contextlib
-import functools
 import gzip
 import json
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from functools import partial, reduce
 from ssl import create_default_context
-from typing import TYPE_CHECKING, Any, AsyncContextManager, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncContextManager
 from urllib.parse import urlparse
 
 import aiohttp
 import aiomqtt
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping as MappingType
     from types import CoroutineType
-    from typing import Mapping, TypedDict
+    from typing import TypedDict
 
     # WISDispatcher types
     StatelessContext = Callable[[], AsyncContextManager[None]]
-    StatefullContext = Callable[[], AsyncContextManager[Mapping[str, object]]]
+    StatefullContext = Callable[[], AsyncContextManager[MappingType[str, object]]]
     ContextFunction = StatelessContext | StatefullContext
 
     StatelessDispatch = Callable[["WISMessage"], CoroutineType]
-    StatefullDispatch = Callable[[Mapping[str, Any], "WISMessage"], CoroutineType]
+    StatefullDispatch = Callable[[MappingType[str, Any], "WISMessage"], CoroutineType]
     DispatchFunction = StatelessDispatch | StatefullDispatch
 
     # Context when downloading WIS2 data
@@ -390,7 +392,7 @@ class WISConnection:
         return f"WISConnection({self.username}@{self.hostname}, topics='{'\', \''.join(self.topics)}')"
 
 
-@contextlib.asynccontextmanager
+@asynccontextmanager
 async def http_session() -> AsyncIterator[DownloadContext]:
     """A context manager for WISDispatcher that yields a http (eventually ftp also) client."""
     async with aiohttp.ClientSession() as session:
@@ -461,7 +463,7 @@ class WISDispatcher:
     """
 
     dispatch_function: DispatchFunction
-    context_function: ContextFunction = field(default=lambda: contextlib.nullcontext(None))
+    context_function: ContextFunction = field(default=lambda: nullcontext(None))
 
     def __post_init__(self) -> None:
         LOG.debug("Created %s", self)
@@ -471,7 +473,7 @@ class WISDispatcher:
 
         async with self.context_function() as context:
             # If no context is given, don't pass to dispatch function
-            f = self.dispatch_function if context is None else functools.partial(self.dispatch_function, context)
+            f = self.dispatch_function if context is None else partial(self.dispatch_function, context)
 
             while True:
                 msg = await _from.get()
@@ -594,7 +596,10 @@ def parse_cli_args():
         metavar="FSTRING",
         dest="action",
         type=WISDispatcher.fprint_messages,
-        help="Print a formatted string based on keys in the payload. E.g. '{properties.data_id}:{properties.start_time}'",
+        help=(
+            "Print a formatted string based on keys in the payload."
+            " E.g. '{properties.data_id}:{properties.start_time}'"
+        ),
     )
     action_parser.add_argument(
         "-D",
@@ -602,7 +607,10 @@ def parse_cli_args():
         metavar="DIR",
         dest="action",
         type=WISDispatcher.download_data,
-        help="Download the file data described in each WIS2 payload to a directory. File name is automatically determined from the payload.",
+        help=(
+            "Download the file data described in each WIS2 payload to a directory."
+            " File name is automatically determined from the payload."
+        ),
     )
 
     args = parser.parse_args()
@@ -621,7 +629,7 @@ async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConnecti
 
     data.get("properties", {}).update(
         __topic__=str(msg.topic),
-        __reception_time__=datetime.now(tz=timezone.utc).isoformat(),
+        __reception_time__=datetime.now(tz=UTC).isoformat(),
         __reception_host__=client.hostname,
     )
 
