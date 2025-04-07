@@ -69,34 +69,45 @@ if TYPE_CHECKING:
 LOG = logging.getLogger("wiswatch")
 
 
-class WNMConformanceError(Exception):
+class WNMConformanceError(ValueError):
     """An MQTT payload wasn't conformant with the WNM specification
 
     https://wmo-im.github.io/wis2-notification-message/standard/wis2-notification-message-STABLE.html
     """
 
 
-class WISMessage(dict[str, Any]):
+class WISMessage(Mapping):
     """A bare-bones wrapper around a dictionary that provides:
-        - lazy validation
-        - improved formatting
-        - helpful instance methods
+        - lazy WNM validation
+        - useful formatting syntax
+        - instance methods
     specifically for WIS2 Notification Messages.
     """
 
+    __slots__ = ("__access_link", "__canon_url", "_data")
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._data: dict[str, Any] = {}
+        self._data.update(*args, **kwargs)
+        self.__access_link = None
+        self.__canon_url = None
+
     @classmethod
     def from_json(cls, s: str | bytes | bytearray) -> WISMessage:
+        """Load a WISMessage from a JSON string, bytes, or bytearray.
+
+        Raises:
+            JSONDecodeError: Non-JSON input.
+            WNMConformanceError: JSON object missing required field(s).
+        """
+
         def _decode_wnm(d: dict):
             """Just turn the top-level dictionary into a WISMessage."""
             if all(req_key in d for req_key in ("id", "links", "properties", "geometry", "type")):
                 return cls(**d)
             return d
 
-        try:
-            obj = json.loads(s, object_hook=_decode_wnm)
-        except ValueError as e:
-            err = 'Non-json message'
-            raise WNMConformanceError(err) from e
+        obj = json.loads(s, object_hook=_decode_wnm)
 
         # this happens for valid json where no object is turned into a WISMessage in ``_decode_wnm``
         if not isinstance(obj, cls):
@@ -105,6 +116,87 @@ class WISMessage(dict[str, Any]):
             raise WNMConformanceError(err)
 
         return obj
+
+    def to_json(self, **kwargs) -> str:
+        """Turn WISMessage into a JSON string.
+
+        Args:
+            **kwargs: same as json.dumps.
+        """
+        return json.dumps(self._data, **kwargs)
+
+    @property
+    def access_link(self):
+        """The link object with the 'canonical' reference to the data.
+
+        Raises:
+            WNMConformanceError: The data the this WISMessage describes isn't conformant.
+        """
+        # TODO: track conformance, so re-checking isn't necessary
+        if self.__access_link is None:
+            links = self._data.get("links")
+            if links is None:
+                raise WNMConformanceError("Missing required 'links' property")
+            if not isinstance(links, list):
+                raise WNMConformanceError(f"'links' property is of type '{type(links).__name__}', exepected 'list'")
+
+            for link in links:
+                if not isinstance(link, dict):
+                    raise WNMConformanceError(f"link {link} in 'links' is {type(link).__name__} not dict")
+
+                link_rel = link.get("rel")
+                if link_rel == "canonical":
+                    self.__access_link = link
+                    return self.__access_link
+            raise WNMConformanceError("No 'canonical' link in 'links'")
+
+        return self.__access_link
+
+    @property
+    def canonical_url(self) -> str:
+        """URL to data the notification is describing.
+
+        Raises:
+            WNMConformanceError: The data the this WISMessage describes isn't conformant.
+        """
+        if self.__canon_url is None:
+            url = self.access_link.get("href")
+            if url is None or not isinstance(url, str):
+                raise WNMConformanceError("Missing 'href' property for canonical link")
+            if not url.startswith(("http://", "https://", "ftp://", "sftp://")):
+                raise WNMConformanceError("'href' for canonical link not http/s or s/ftp")
+            self.__canon_url = url
+
+        return self.__canon_url
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getitem__(self, key: str) -> Any:
+        """Supports 'multi-keys', e.g. WISMessage['key.subkey'], and 'quick keys',
+        e.g. WISMessage['@access_link'].
+        """
+        if not isinstance(key, str):
+            err = f"key must be type 'str', got {type(key).__name__}"
+            raise TypeError(err)
+
+        if key.startswith("@"):
+            # A 'quick' key, uses a property to get value
+            # This is mostly useful when creating a format string
+            #   e.g. '{@access_link}'.format_map(WISMessage)
+
+            qkey, *multi = key[1:].split(".")
+
+            # AttributeError should be raises, user error with format string
+            data = getattr(self, qkey)
+        else:
+            multi = key.split(".")
+            data = self._data
+
+        return reduce(dict.__getitem__, multi, data)
 
     async def iter_data(
         self, session: aiohttp.ClientSession | None = None, chunk_size: int = 2048
@@ -122,17 +214,19 @@ class WISMessage(dict[str, Any]):
         Yields:
             bytes: Chunks of the data content described by the WIS2 Notification Message.
         """
-        inline = self.get("properties", {}).get("content")
+        inline = self.get("properties.content")
+
         if inline:
             if not isinstance(inline, dict):
-                err = f"Invalid WIS2 message: 'properties.content' is {type(inline).__name__}, expceted a dict"
+                err = f"'properties.content' is {type(inline).__name__}, expected a dict"
                 LOG.warning(err)
-                raise ValueError(err)
+                raise WNMConformanceError(err)
+
             encoding = str(inline.get("encoding", "utf-8")).lower()
             content = inline.get("value")
             if content is None:
                 # Undefined in WNM standard, could raise an error, or fallback on links
-                pass
+                raise WNMConformanceError("'properties.content.value' doesn't exist")
             elif encoding == "utf-8":
                 b = content
             elif encoding == "gzip":
@@ -140,62 +234,16 @@ class WISMessage(dict[str, Any]):
             elif encoding == "base64":
                 b = base64.b64decode(content)
             else:
-                err = "Invalid WIS2 message: Unknnown 'properties.content.encoding' '{encoding}', expected 'utf-8', 'gzip', or' base64'"
-                LOG.warning(err)
-                raise ValueError(err)
+                raise WNMConformanceError(
+                    "Unknown 'properties.content.encoding' '{encoding}', expected 'utf-8', 'gzip', or' base64'"
+                )
 
             for i in range(0, len(b), chunk_size):
                 yield b[i:i]
             return
 
-        links = self.get("links")
-        if links is None:
-            err = f"Invalid WIS2 message: missing 'links' key! {self}"
-            LOG.warning(err)
-            raise ValueError(err)
-        if not isinstance(links, list):
-            err = f"Invalid WIS2 message: 'links' value is not list, got {type(links).__name__}"
-            LOG.warning(err)
-            raise TypeError(err)
-
-        # Find canonical link
-        rel_link = None
-        for link in links:
-            if not isinstance(link, dict):
-                err = f"Invalid WIS2 message: link {link} is {type(link).__name__} not dict"
-                LOG.warning(err)
-                raise TypeError(err)
-                # Could continue iterating links, but why support non-conformant messages?
-
-            if link.get("rel") == "canonical":
-                rel_link = link
-                break
-        if rel_link is None:
-            # Couldn't find canonical link
-            err = f"Invalid WIS2 message: no canonical link in 'links' {links}"
-            LOG.warning(err)
-            raise ValueError(err)
-
-        url = rel_link.get("href")
-        if url is None or not isinstance(url, str):
-            err = f"Invalid WIS2 message: canonical link missing 'href' key '{rel_link}'"
-            LOG.warning(err)
-            raise ValueError(err)
-
-        try:
-            o = urlparse(url)
-        except (TypeError, ValueError) as e:
-            err = f"Invalid WIS2 message: canonical url '{url}' couldn't be parsed"
-            LOG.warning(err)
-            raise ValueError(err) from e
-
-        if o.scheme not in ("http", "https", "ftp", "sftp"):
-            err = f"Invalid WIS2 message: canonical url '{url}' not http/s or s/ftp!"
-            LOG.warning(err)
-            raise ValueError(err)
-
         session = aiohttp.ClientSession() if session is None else session
-        async with session.get(url) as resp:
+        async with session.get(self.canonical_url) as resp:
             async for chunk in resp.content.iter_chunked(chunk_size):
                 yield chunk
 
