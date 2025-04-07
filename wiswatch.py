@@ -264,6 +264,8 @@ def all_open_data():
 
 @dataclass
 class WISConnection:
+    """MQTT connection to a WIS2 global broker/cache."""
+
     # Connection kwargs
     hostname: str = field(default="globalbroker.meteo.fr")
     topics: list[str] = field(default_factory=all_open_data)
@@ -279,11 +281,10 @@ class WISConnection:
     reconnect_delay: float = field(default=3.0)
     reconnect_max: int = field(default=-1)
 
-    _mqtt_client: aiomqtt.Client = field(init=False, repr=False)
+    _mqtt_client: aiomqtt.Client | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.port = port_per_transport(self.transport)
-        self._mqtt_client = self._create_client()
 
     @classmethod
     def from_uri(cls, uri: str, **kwargs) -> WISConnection:
@@ -337,22 +338,24 @@ class WISConnection:
 
         return cls(**conn_kwargs, **kwargs)
 
-    def _create_client(self) -> aiomqtt.Client:
+    def _mqtt_connection(self) -> aiomqtt.Client:
         """Create a MQTT client to communicate with server."""
-        return aiomqtt.Client(
-            hostname=self.hostname,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            transport=self.transport,
-            logger=LOG,
-            tls_context=create_default_context(),
-            protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
-        )
+        if self._mqtt_client is None:
+            self._mqtt_client = aiomqtt.Client(
+                hostname=self.hostname,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                transport=self.transport,
+                logger=LOG,
+                tls_context=create_default_context(),
+                protocol=aiomqtt.ProtocolVersion.V5,  # WMO preference
+            )
+        return self._mqtt_client
 
     async def iter_msgs(self) -> AsyncIterator[WISMessage]:
         """Asynchronously iterate over all messages received on this connection."""
-        async with self._mqtt_client:
+        async with self._mqtt_connection():
             LOG.debug("%s connected", self)
             for topic in self.topics:
                 await self._mqtt_client.subscribe(topic, qos=1)
