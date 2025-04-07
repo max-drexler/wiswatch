@@ -306,12 +306,6 @@ class WISConnection:
             LOG.critical(err_msg)
             raise ValueError(err_msg) from e
 
-        try:
-            host = o.hostname
-        except ValueError as e:
-            err_msg = f"URI invalid hostname: {uri}"
-            LOG.critical(err_msg)
-            raise ValueError(err_msg) from e
 
         if not o.scheme or o.scheme.lower() in ("mqtt", "mqtts"):
             transport = "tcp"
@@ -323,8 +317,8 @@ class WISConnection:
             raise ValueError(err_msg)
 
         conn_kwargs: dict = {"transport": transport}
-        if host is not None:
-            conn_kwargs["hostname"] = host
+        if o.hostname is not None:
+            conn_kwargs["hostname"] = o.hostname
 
         if port is not None:
             conn_kwargs["port"] = port
