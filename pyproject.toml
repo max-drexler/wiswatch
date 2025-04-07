@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dependencies = ["aiomqtt"]
+dependencies = ["aiomqtt", "aiohttp"]
 
 [project.scripts]
 wiswatch = "wiswatch:start"
@@ -29,6 +29,88 @@ uvloop = ["uvloop"]
 [tool.hatch.version]
 path = "wiswatch.py"
 
+## Building
+## ========
+## Use with `hatch build`
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# TODO: Specify sdist build.
+
+## Linting
+## =======
+## use with `hatch fmt`
+[tool.ruff]
+target-version = "py37"
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # flake8-bandit
+    "S",
+]
+
+## Type Checking
+## =============
+## Use with `hatch run types:check`
+##
+[tool.hatch.envs.types]
+dependencies = ["pyright>=1.1.0"]
+installer = "uv"
+
+[tool.hatch.envs.types.scripts]
+check = "pyright"
+
+[[tool.hatch.envs.types.matrix]]
+python = ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7"]
+
+[tool.pyright]
+# Make pyright use the hatch environment
+#   -> This requires `hatch config set dirs.env.virtual .hatch`
+venvPath = ".hatch"
+venv = "wiswatch"
+
+include = ["wiswatch.py", "tests/"]
+pythonVersion = "3.7"
+
+## Testing
+## =======
+## Use with `hatch test`
+[tool.hatch.envs.hatch-test]
+extra-dependencies = ["coverage[xml, html]"]
+
+[tool.hatch.envs.hatch-test.scripts]
+# Default scripts: must be redefined when overwriting this section
+run = "pytest{env:HATCH_TEST_ARGS:} {args}"
+run-cov = "coverage run -m pytest{env:HATCH_TEST_ARGS:} {args}"
+cov-combine = "coverage combine"
+# Added `coverage xml` and `coverage html` to generate report for CI and debugging
+cov-report = "coverage report && coverage xml && coverage html"
+
+[[tool.hatch.envs.hatch-test.matrix]]
+python = ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7"]
+
+[tool.coverage.run]
+source_pkgs = ["wiswatch"]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+exclude_also = [
+    "no cov",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "if tp.TYPE_CHECKING",
+]
