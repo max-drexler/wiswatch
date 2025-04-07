@@ -397,71 +397,26 @@ async def http_session() -> AsyncIterator[DownloadContext]:
         yield {"session": session}
 
 
-async def wis2_data_download(session: aiohttp.ClientSession, directory: str, msg: dict) -> None:
+async def wis2_data_download(session: aiohttp.ClientSession, directory: str, msg: WISMessage) -> None:
     """Download the data a WIS2 notification is describing."""
-    props = msg.get("properties")
-    if props is None:
-        LOG.warning("Invalid WIS2 message: missing 'properties' key! %s", msg)
-        return
-
-    inline = props.get("content")
-    if inline is not None:
-        LOG.critical("Inline download not yet supported!")
-        return
-
-    links = msg.get("links")
-    if links is None:
-        LOG.warning("Invalid WIS2 message: missing 'links' key! %s", msg)
-        return
-    if not isinstance(links, list):
-        LOG.warning("Invalid WIS2 message: 'links' value is not list, got %s", type(links).__name__)
-        return
-
-    # Find canonical link
-    rel_link = None
-    for link in links:
-        if not isinstance(link, dict):
-            LOG.warning("Invalid WIS2 message: link %s is %s not dict", link, type(link).__name__)
-            # Could continue iterating, but why support non-conformant messages?
-            return
-
-        relation = link.get("rel")
-        if relation in ("update", "deletion"):
-            LOG.info("wiswatch doesn't currently support update/deletion notifications")
-            # TODO: support updating files, optionally support deleting old files.
-            return
-        if relation == "canonical":
-            if rel_link is not None:
-                LOG.warning("WIS2 notification has multiple canonical links, defaulting to the last one, %s", links)
-            rel_link = link
-
-    if rel_link is None:
-        # Couldn't find canonical link
-        LOG.warning("Invalid WIS2 message: no canonical link in 'links' %s", links)
-        return
-
-    url = rel_link.get("href")
-    if url is None or not isinstance(url, str) or not url.startswith(("http://", "https://", "ftp://", "sftp://")):
-        LOG.warning("Invalid WIS2 message: non-valid canonical url '%s'", url)
-        return
 
     try:
-        o = urlparse(url)
-    except (TypeError, ValueError) as e:
-        LOG.warning("Invalid WIS2 message: canonical url couldn't be parsed '%s'", str(e))
+        url = msg.canonical_url
+        file_path = urlparse(url).path
+    except (WNMConformanceError, TypeError, ValueError) as e:
+        LOG.warning("Got inconformant WIS message: %s", str(e))
         return
 
     # Stream file remote content to file
-    download_file = os.path.join(directory, os.path.basename(o.path))
+    download_file = os.path.join(directory, os.path.basename(file_path))
     if os.path.isfile(download_file):
         LOG.critical("WIS2 data file '%s' already exists!", download_file)
         return
 
     # TODO: suppress SIGINT to avoid file corruption
     with open(download_file, "wb") as f:  # noqa: ASYNC101 (might need to come back to this)
-        async with session.get(url) as resp:
-            async for chunk in resp.content.iter_chunked(2048):
-                f.write(chunk)
+        async for chunk in msg.iter_data(session):
+            f.write(chunk)
 
     # Verify integrity of file
     #
@@ -530,7 +485,7 @@ class WISDispatcher:
 
         async def print_wis(msg: WISMessage):
             """Default action. Print json string of message."""
-            sys.stdout.write(json.dumps(msg, indent=indent) + end)
+            sys.stdout.write(msg.to_json(indent=indent) + end)
             sys.stdout.flush()
 
         return cls(print_wis)
@@ -561,6 +516,9 @@ class WISDispatcher:
             download_wrapper,
             http_session,
         )
+
+    def __str__(self) -> str:
+        return f"WISDispatcher({self.dispatch_function.__name__})"
 
 
 WISWATCH_EPILOG = """For more information on WIS2, see the following:
