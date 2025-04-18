@@ -40,7 +40,7 @@ import sys
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from functools import partial, reduce
 from ssl import create_default_context
 from typing import TYPE_CHECKING, Any, AsyncContextManager
@@ -52,16 +52,16 @@ import aiomqtt
 if TYPE_CHECKING:
     from collections.abc import Mapping as MappingType
     from types import CoroutineType
-    from typing import TypedDict
+    from typing import TypedDict, Union
 
     # WISDispatcher types
     StatelessContext = Callable[[], AsyncContextManager[None]]
     StatefullContext = Callable[[], AsyncContextManager[MappingType[str, object]]]
-    ContextFunction = StatelessContext | StatefullContext
+    ContextFunction = Union[StatelessContext, StatefullContext]
 
     StatelessDispatch = Callable[["WISMessage"], CoroutineType]
     StatefullDispatch = Callable[[MappingType[str, Any], "WISMessage"], CoroutineType]
-    DispatchFunction = StatelessDispatch | StatefullDispatch
+    DispatchFunction = Union[StatelessDispatch, StatefullDispatch]
 
     # Context when downloading WIS2 data
     class DownloadContext(TypedDict):
@@ -623,7 +623,7 @@ async def add_msg_defaults(data: dict, msg: aiomqtt.Message, client: WISConnecti
 
     data.get("properties", {}).update(
         __topic__=str(msg.topic),
-        __reception_time__=datetime.now(tz=UTC).isoformat(),
+        __reception_time__=datetime.now(tz=timezone.utc).isoformat(),
         __reception_host__=client.hostname,
     )
 

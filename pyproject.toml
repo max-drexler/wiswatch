@@ -67,20 +67,17 @@ select = [
 ## Use with `hatch run types:check`
 ##
 [tool.hatch.envs.types]
-dependencies = ["pyright>=1.1.0"]
+dependencies = ["pyright[nodejs]>=1.1.0"]
 installer = "uv"
 
 [tool.hatch.envs.types.scripts]
-check = "pyright"
-
-[[tool.hatch.envs.types.matrix]]
-python = ["3.13", "3.12", "3.11", "3.10", "3.9", "3.8", "3.7"]
+check = "pyright {args}"
 
 [tool.pyright]
 # Make pyright use the hatch environment
 #   -> This requires `hatch config set dirs.env.virtual .hatch`
 venvPath = ".hatch"
-venv = "wiswatch"
+venv = "types"
 
 include = ["wiswatch.py", "tests/"]
 pythonVersion = "3.7"
